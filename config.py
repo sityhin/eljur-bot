@@ -5,8 +5,17 @@ from dataclasses import dataclass
 from datetime import time
 from zoneinfo import ZoneInfo
 
+from pathlib import Path
+
 from dotenv import load_dotenv
 
+# На Bothost (бесплатный тариф) нет переменных окружения: .env с паролями кладётся вручную
+# в постоянную папку /app/data, а не в публичный репозиторий. База тогда тоже живёт там.
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+if (DATA_DIR / ".env").is_file():
+    load_dotenv(DATA_DIR / ".env")
+    # относительный путь (DB_PATH=eljur_bot.db из обычного .env) тоже отправляем в DATA_DIR, иначе база пропадёт при рестарте
+    os.environ["DB_PATH"] = str(DATA_DIR / os.getenv("DB_PATH", "eljur_bot.db"))
 load_dotenv()
 
 
