@@ -7,7 +7,7 @@ import os
 import socket
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from html import escape
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -30,7 +30,7 @@ os.chdir(BASE_DIR)  # .env и база лежат рядом с bot.py, отку
 
 import config  # noqa: E402
 import formatter as fmt  # noqa: E402
-from eljur import Day, EljurClient, EljurError
+from eljur import Day, EljurClient, EljurError, SubjectGrades
 from storage import Storage, StoredTask
 
 log = logging.getLogger("eljur_bot")
@@ -40,26 +40,38 @@ client = EljurClient(cfg.eljur_domain, cfg.eljur_login, cfg.eljur_password, cfg.
 sync_lock = asyncio.Lock()
 router = Router()
 
-HELP = (
-    "Я слежу за электронным журналом и каждый день в "
-    f"{cfg.send_time:%H:%M} присылаю сводку:\n"
-    "• что было сегодня (уроки, темы, оценки);\n"
-    "• расписание и ДЗ на завтра;\n"
-    "• задания на будущее, которые надо делать заранее. Они приходят каждый день до даты сдачи.\n\n"
-    "/report: сводка прямо сейчас\n"
-    "/tomorrow: расписание и ДЗ на завтра\n"
-    "/long: задания на будущее + кнопки «сделано»\n"
-    "/marks: оценки по всем предметам, новые выделены жирным\n"
-    "/pause: приостановить рассылку на время (например, на каникулы)\n"
-    "/resume: возобновить рассылку раньше срока\n"
-    "/stop: отписаться от ежедневной рассылки"
-)
+def send_time() -> time:
+    """Время сводки: владелец меняет его командой /time, иначе берём SEND_TIME из настроек."""
+    value = storage.get_meta("send_time")
+    if value:
+        hh, mm = value.split(":")
+        return time(int(hh), int(mm))
+    return cfg.send_time
+
+
+def help_text() -> str:
+    return (
+        "Я слежу за электронным журналом и каждый день в "
+        f"{send_time():%H:%M} присылаю сводку:\n"
+        "• что было сегодня (уроки, темы) и новые оценки;\n"
+        "• расписание и ДЗ на завтра;\n"
+        "• задания на будущее, которые надо делать заранее. Они приходят каждый день до даты сдачи.\n\n"
+        "/report: сводка прямо сейчас\n"
+        "/tomorrow: расписание и ДЗ на завтра\n"
+        "/long: задания на будущее + кнопки «сделано»\n"
+        "/marks: оценки по всем предметам с датой и типом, новые за день отмечены 🔴\n"
+        "/pause: приостановить рассылку на время (например, на каникулы)\n"
+        "/resume: возобновить рассылку раньше срока\n"
+        "/time: время сводки (менять может только владелец)\n"
+        "/stop: отписаться от ежедневной рассылки"
+    )
 
 
 @dataclass
 class Snapshot:
     today: date
     days: dict[date, Day]
+    grades: list[SubjectGrades] | None = None  # None — страницу успеваемости не загружали (или не смогли)
 
     @property
     def today_day(self) -> Day | None:
@@ -82,16 +94,28 @@ def now() -> datetime:
     return datetime.now(cfg.tz)
 
 
-async def refresh() -> Snapshot:
+async def refresh(with_grades: bool = False) -> Snapshot:
     async with sync_lock:
         today = now().date()
         days = await client.get_days(today, weeks_back=1, weeks_ahead=cfg.weeks_ahead)
         storage.sync(days, today)
-        return Snapshot(today, days)
+        grades = None
+        if with_grades:
+            try:
+                grades = await client.get_grades()
+                storage.sync_grades(grades, today)
+            except Exception:  # сводка уйдёт и без них: оценки тогда возьмём из дневника
+                log.exception("grades failed")
+        return Snapshot(today, days, grades)
 
 
 def build_daily(snap: Snapshot) -> str:
     since = storage.get_meta("last_report", "")
+    new_grades = None
+    if snap.grades is not None:
+        # со страницы успеваемости видны и оценки, выставленные сегодня за старые уроки
+        keys = storage.new_grade_keys(since)
+        new_grades = [g for s in snap.grades for g in s.grades if g.key in keys]
     return fmt.daily_report(
         today=snap.today,
         today_day=snap.today_day,
@@ -99,6 +123,7 @@ def build_daily(snap: Snapshot) -> str:
         long_tasks=storage.upcoming(snap.long_after, include_done=False),
         new_tasks=storage.new_tasks_since(since, snap.today),
         new_marks=storage.new_marks_since(since),
+        new_grades=new_grades,
     )
 
 
@@ -129,10 +154,10 @@ async def send_long(bot: Bot, chat_id: int, text: str, keyboard: InlineKeyboardM
         await bot.send_message(chat_id, chunk, reply_markup=markup)
 
 
-async def with_data(message: Message, action) -> None:
+async def with_data(message: Message, action, with_grades: bool = False) -> None:
     wait = await message.answer("⏳ Захожу в журнал…")
     try:
-        snap = await refresh()
+        snap = await refresh(with_grades)
     except EljurError as e:
         await wait.edit_text(f"⚠️ {e}")
         return
@@ -210,7 +235,7 @@ async def on_access(callback: CallbackQuery) -> None:
         await callback.answer("Доступ открыт")
         await callback.message.edit_text(f"✅ {name} теперь пользуется ботом. Список: /users")
         await callback.bot.send_message(
-            user_id, "✅ Доступ открыт! Ты подписан на ежедневную сводку.\n\n" + HELP, reply_markup=MENU
+            user_id, "✅ Доступ открыт! Ты подписан на ежедневную сводку.\n\n" + help_text(), reply_markup=MENU
         )
     else:
         storage.set_meta(f"request:{user_id}", "denied")
@@ -268,12 +293,12 @@ MENU = ReplyKeyboardMarkup(
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     storage.add_subscriber(message.chat.id)
-    await message.answer("Привет! Ты подписан на ежедневную сводку.\n\n" + HELP, reply_markup=MENU)
+    await message.answer("Привет! Ты подписан на ежедневную сводку.\n\n" + help_text(), reply_markup=MENU)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP, reply_markup=MENU)
+    await message.answer(help_text(), reply_markup=MENU)
 
 
 @router.message(Command("stop"))
@@ -354,7 +379,44 @@ async def on_pause(callback: CallbackQuery) -> None:
 @router.message(Command("resume"))
 async def cmd_resume(message: Message) -> None:
     set_pause(message.chat.id, None)
-    await message.answer(f"▶️ Рассылка снова включена: сводка придёт в {cfg.send_time:%H:%M}.")
+    await message.answer(f"▶️ Рассылка снова включена: сводка придёт в {send_time():%H:%M}.")
+
+
+# ---------------------------------------------------------------- время сводки
+
+def parse_time(text: str) -> time | None:
+    """«19:00», «19.00», «9:30» или просто «19»."""
+    parts = text.strip().replace(".", ":").split(":")
+    try:
+        if len(parts) == 1:
+            return time(int(parts[0]), 0)
+        if len(parts) == 2:
+            return time(int(parts[0]), int(parts[1]))
+    except ValueError:
+        pass
+    return None
+
+
+@router.message(Command("time"))
+async def cmd_time(message: Message, command: CommandObject) -> None:
+    if not is_owner(message.from_user.id):
+        await message.answer(f"Сводка приходит в {send_time():%H:%M}. Поменять время может только владелец.")
+        return
+    if not command.args:
+        await message.answer(
+            f"🕒 Сводка приходит в <b>{send_time():%H:%M}</b>.\n"
+            "Чтобы поменять, напиши, например, <code>/time 19:00</code>."
+        )
+        return
+    new = parse_time(command.args)
+    if new is None:
+        await message.answer("Не понял время. Напиши, например, <code>/time 19:00</code>.")
+        return
+    storage.set_meta("send_time", f"{new:%H:%M}")
+    text = f"🕒 Готово: сводка будет приходить в <b>{new:%H:%M}</b>."
+    if storage.get_meta("last_daily") == now().date().isoformat():
+        text += "\nСегодняшняя уже была, по новому времени — со следующего раза."
+    await message.answer(text)
 
 
 @router.message(F.text == BTN_REPORT)
@@ -362,7 +424,7 @@ async def cmd_resume(message: Message) -> None:
 async def cmd_report(message: Message) -> None:
     async def act(snap: Snapshot) -> None:
         await send_long(message.bot, message.chat.id, build_daily(snap))
-    await with_data(message, act)
+    await with_data(message, act, with_grades=True)
 
 
 @router.message(F.text == BTN_TOMORROW)
@@ -394,11 +456,20 @@ async def cmd_marks(message: Message) -> None:
         await wait.edit_text(f"⚠️ Не удалось получить оценки из журнала: {e}")
         return
     await wait.delete()
-    # «новые» = появились с прошлого просмотра /marks в этом чате
-    view_key = f"grades_view:{message.chat.id}"
-    new_keys = storage.new_grade_keys(storage.get_meta(view_key, ""))
+    new_keys = storage.new_grade_keys(grades_since(message.chat.id))
     await send_long(message.bot, message.chat.id, fmt.section_grades(subjects, new_keys))
-    storage.set_meta(view_key, datetime.now().isoformat(timespec="seconds"))
+
+
+def grades_since(chat_id: int) -> str:
+    """С какого момента оценки в «Оценках» считаются новыми: с последнего просмотра *до сегодняшнего дня*.
+    Поэтому новая оценка остаётся выделенной весь день, сколько бы раз ни открывали «Оценки».
+    Время — как у first_seen в базе (datetime.now() сервера)."""
+    stamp = datetime.now().isoformat(timespec="seconds")
+    last = storage.get_meta(f"grades_view:{chat_id}")
+    if last and last[:10] < stamp[:10]:
+        storage.set_meta(f"grades_seen:{chat_id}", last)
+    storage.set_meta(f"grades_view:{chat_id}", stamp)
+    return storage.get_meta(f"grades_seen:{chat_id}", "")
 
 
 @router.callback_query(F.data.startswith("t:"))
@@ -428,7 +499,7 @@ async def on_toggle(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------- рассылка
 
 async def send_daily(bot: Bot) -> None:
-    snap = await refresh()
+    snap = await refresh(with_grades=True)
     text = build_daily(snap)
     for chat_id in storage.subscribers():
         if paused_until(chat_id, snap.today):
@@ -444,7 +515,7 @@ def daily_due(current: datetime) -> bool:
     """Сегодня день рассылки, время уже наступило, а сводка сегодня ещё не уходила."""
     return (
         current.isoweekday() in cfg.send_days
-        and current.time() >= cfg.send_time
+        and current.time() >= send_time()
         and storage.get_meta("last_daily") != current.date().isoformat()
     )
 
@@ -506,6 +577,7 @@ COMMANDS = [
     BotCommand(command="marks", description="Оценки по всем предметам"),
     BotCommand(command="pause", description="Приостановить рассылку (каникулы)"),
     BotCommand(command="resume", description="Возобновить рассылку"),
+    BotCommand(command="time", description="Время сводки (меняет владелец)"),
     BotCommand(command="help", description="Что умеет бот"),
     BotCommand(command="stop", description="Отписаться от рассылки"),
 ]

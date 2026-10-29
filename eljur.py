@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -183,6 +184,7 @@ class Grade:
     date: date
     value: str  # «5», «4/4» (двойная), «Н» (пропуск)
     weight: float | None = None
+    kind: str = ""  # «к» констатирующая, «т» творческая, «ф» формирующая; пусто — тип не задан
 
     @property
     def numbers(self) -> list[int]:
@@ -206,9 +208,26 @@ class SubjectGrades:
         return total / weights if weights else None
 
 
+_SET_RE = re.compile(r'"(\d+)":(\{"id":"\1"[^{}]*\})')
+
+
+def _mark_sets(html: str) -> dict[str, str]:
+    """set_id -> короткий тип оценки. Наборы лежат в JSON внутри скрипта страницы:
+    "791258":{"id":"791258","name":"Формирующая",...,"mtype_short":"Ф"}."""
+    sets = {}
+    for m in _SET_RE.finditer(html):
+        try:
+            short = json.loads(m.group(2)).get("mtype_short") or ""
+        except ValueError:
+            continue
+        sets[m.group(1)] = short.lower()
+    return sets
+
+
 def parse_grades(html: str) -> list[SubjectGrades]:
     """Таблица успеваемости: колонки .cells_marks, в каждой по ячейке на предмет."""
     soup = BeautifulSoup(html, "html.parser")
+    sets = _mark_sets(html)
     subjects = {
         cell["name"]: SubjectGrades(cell["name"])
         for cell in soup.select("#g0_fio .cell[name]")
@@ -228,6 +247,7 @@ def parse_grades(html: str) -> list[SubjectGrades]:
             date=date.fromisoformat(mark_date),
             value=value,
             weight=weight,
+            kind=sets.get(cell.get("set_id", ""), ""),
         ))
     for s in subjects.values():
         s.grades.sort(key=lambda g: g.date)

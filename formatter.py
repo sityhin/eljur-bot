@@ -5,7 +5,7 @@ import re
 from datetime import date
 from html import escape
 
-from eljur import Day, Lesson, SubjectGrades
+from eljur import Day, Grade, Lesson, SubjectGrades
 from storage import StoredMark, StoredTask
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -86,7 +86,7 @@ def _mark_line(subject: str, value: str, weight: str, kind: str, comment: str) -
 
 # ---------------------------------------------------------------- секции
 
-def section_today(day: Day | None, today: date) -> str:
+def section_today(day: Day | None, today: date, with_marks: bool = True) -> str:
     title = f"📖 <b>Сегодня, {WEEKDAYS[today.weekday()]} {today:%d.%m}</b>"
     if not day or not day.lessons:
         return f"{title}\nУроков не было."
@@ -100,7 +100,7 @@ def section_today(day: Day | None, today: date) -> str:
         if topics:
             line += f"\n    <i>{escape('; '.join(topics))}</i>"
         lines.append(line)
-    marks = [(l.subject, m) for l in day.lessons for m in l.marks]
+    marks = [(l.subject, m) for l in day.lessons for m in l.marks] if with_marks else []
     if marks:
         lines.append("\n⭐ <b>Оценки за сегодня:</b>")
         lines += [_mark_line(s, m.value, m.weight, m.kind, m.comment) for s, m in marks]
@@ -180,26 +180,57 @@ def section_new_tasks(tasks: list[StoredTask], today: date) -> str:
 
 
 def _avg_icon(avg: float) -> str:
-    return "🟢" if avg >= 4.5 else "🟡" if avg >= 3.5 else "🔴"
+    return "🟢" if avg >= 4.5 else "🟡" if avg >= 3.5 else "🟠"  # 🔴 занят под новые оценки
+
+
+KINDS = {"к": "констатирующая", "т": "творческая", "ф": "формирующая"}
+NEW_MARK = "🔴"  # цвет текста Telegram не поддерживает, поэтому новые оценки отмечаем значком и жирным
+
+
+def _grade_value(g: Grade) -> str:
+    return escape(g.value.lower() if not g.numbers else g.value)
+
+
+def _grade_note(g: Grade) -> str:
+    """«28.10 ф»: дата и тип; тип не показываем, если его нет."""
+    return f"{g.date:%d.%m}" + (f" {g.kind}" if g.kind else "")
 
 
 def section_grades(subjects: list[SubjectGrades], new_keys: set[str]) -> str:
     with_marks = [s for s in subjects if s.grades]
     new_count = sum(g.key in new_keys for s in with_marks for g in s.grades)
     lines = ["📊 <b>Оценки по предметам</b>"]
-    lines.append(f"🆕 Новых: <b>{new_count}</b> (выделены жирным)" if new_count else "Новых оценок нет.")
+    lines.append(f"🆕 Новых за день: <b>{new_count}</b> (отмечены {NEW_MARK})" if new_count else "Новых оценок нет.")
     for s in with_marks:
         avg = s.average
         head = f"\n{_avg_icon(avg)} {escape(s.subject)} · ср. {avg:.2f}" if avg is not None else f"\n⚪️ {escape(s.subject)}"
         marks = []
         for g in s.grades:
-            value = escape(g.value.lower() if not g.numbers else g.value)
-            marks.append(f"<b>{value}</b>" if g.key in new_keys else value)
-        lines += [head, "    " + "  ".join(marks)]
+            value = f"{NEW_MARK}<b>{_grade_value(g)}</b>" if g.key in new_keys else _grade_value(g)
+            marks.append(f"{value} <i>{_grade_note(g)}</i>")
+        lines += [head, "    " + ",  ".join(marks)]
     empty = [s.subject for s in subjects if not s.grades]
     if empty:
         lines.append(f"\n<i>Пока без оценок: {escape(', '.join(empty))}</i>")
-    lines.append("\n<i>ср. = средневзвешенная с учётом веса оценок; н = пропуск</i>")
+    lines.append(
+        "\n<i>ср. = средневзвешенная с учётом веса оценок; н = пропуск;\n"
+        "к = констатирующая, т = творческая, ф = формирующая</i>"
+    )
+    return "\n".join(lines)
+
+
+def section_new_grades(grades: list[Grade]) -> str:
+    """Оценки, появившиеся в журнале со времени прошлой сводки (в том числе за старые уроки)."""
+    if not grades:
+        return "⭐ <b>Новых оценок нет.</b>"
+    lines = ["⭐ <b>Новые оценки:</b>"]
+    for g in sorted(grades, key=lambda g: (g.subject, g.date)):
+        details = [f"{g.date:%d.%m}"]
+        if g.kind:
+            details.append(KINDS.get(g.kind, g.kind))
+        if g.weight is not None:
+            details.append(f"вес {g.weight:g}")
+        lines.append(f"{NEW_MARK} <b>{_grade_value(g)}</b> — {escape(g.subject)} <i>({', '.join(details)})</i>")
     return "\n".join(lines)
 
 
@@ -210,10 +241,16 @@ def daily_report(
     long_tasks: list[StoredTask],
     new_tasks: list[StoredTask],
     new_marks: list[StoredMark],
+    new_grades: list[Grade] | None = None,
 ) -> str:
+    """new_grades — оценки со страницы успеваемости. Если их удалось загрузить, они заменяют оценки из дневника
+    (дневник видит только последнюю неделю и пропускает оценки, выставленные позже за старые уроки)."""
+    if new_grades is not None:
+        marks = [section_today(today_day, today, with_marks=False), section_new_grades(new_grades)]
+    else:
+        marks = [section_today(today_day, today), section_new_marks(new_marks, today)]
     parts = [
-        section_today(today_day, today),
-        section_new_marks(new_marks, today),
+        *marks,
         section_new_tasks(new_tasks, today),
         section_next_day(next_day, today),
         section_long(long_tasks, today),
