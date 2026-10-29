@@ -180,11 +180,11 @@ def section_new_tasks(tasks: list[StoredTask], today: date) -> str:
 
 
 def _avg_icon(avg: float) -> str:
-    return "🟢" if avg >= 4.5 else "🟡" if avg >= 3.5 else "🟠"  # 🔴 занят под новые оценки
+    return "🟢" if avg >= 4.5 else "🟡" if avg >= 3.5 else "🔴"
 
 
 KINDS = {"к": "констатирующая", "т": "творческая", "ф": "формирующая"}
-NEW_MARK = "🔴"  # цвет текста Telegram не поддерживает, поэтому новые оценки отмечаем значком и жирным
+NEW_MARK = "‼️"  # цвет текста Telegram не поддерживает, поэтому новые оценки отмечаем красным значком и жирным
 
 
 def _grade_value(g: Grade) -> str:
